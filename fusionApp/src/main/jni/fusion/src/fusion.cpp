@@ -31,18 +31,31 @@ static std::string jstring_value(JNIEnv *env, jstring value) {
     return result;
 }
 
-static bool extract_asset_tree(AAssetManager *assets, const std::string &assetRoot,
-                               const fs::path &destination) {
-    AAssetDir *directory = AAssetManager_openDir(assets, assetRoot.c_str());
-    if (!directory) {
-        log_format(LogLevel::ERROR, TAG, "Could not open runtime asset directory {}", assetRoot);
+static bool extract_asset_tree(JNIEnv *env, jobject javaAssets, jmethodID listAssets,
+                               AAssetManager *assets, const std::string &assetRoot,
+                               const fs::path &destination, size_t &verifiedFiles) {
+    jstring root = env->NewStringUTF(assetRoot.c_str());
+    auto names = static_cast<jobjectArray>(env->CallObjectMethod(javaAssets, listAssets, root));
+    env->DeleteLocalRef(root);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        log_format(LogLevel::ERROR, TAG, "Could not list runtime assets at {}", assetRoot);
+        return false;
+    }
+    if (!names) return false;
+    const jsize count = env->GetArrayLength(names);
+    if (count == 0) {
+        env->DeleteLocalRef(names);
+        log_format(LogLevel::ERROR, TAG, "Runtime asset directory is empty or missing: {}", assetRoot);
         return false;
     }
     fs::create_directories(destination);
     bool success = true;
-    const char *name = nullptr;
-    while ((name = AAssetDir_getNextFileName(directory)) != nullptr) {
-        if (std::string_view(name).find("..") != std::string_view::npos) {
+    for (jsize i = 0; i < count; ++i) {
+        auto javaName = static_cast<jstring>(env->GetObjectArrayElement(names, i));
+        const std::string name = jstring_value(env, javaName);
+        env->DeleteLocalRef(javaName);
+        if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\:") != std::string::npos) {
             success = false;
             continue;
         }
@@ -50,33 +63,75 @@ static bool extract_asset_tree(AAssetManager *assets, const std::string &assetRo
         const fs::path outputPath = destination / name;
         AAsset *asset = AAssetManager_open(assets, assetPath.c_str(), AASSET_MODE_STREAMING);
         if (!asset) {
-            success = extract_asset_tree(assets, assetPath, outputPath) && success;
+            success = extract_asset_tree(env, javaAssets, listAssets, assets, assetPath, outputPath, verifiedFiles) && success;
             continue;
         }
-        fs::create_directories(outputPath.parent_path());
-        std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+        const auto expectedSize = static_cast<uintmax_t>(AAsset_getLength64(asset));
+        const bool existing = fs::is_regular_file(outputPath);
+        // retain user config, but repair missing/truncated runtime files
+        // even when an older build left a success marker behind
+        if (existing && ((name == "BepInEx.cfg" && fs::file_size(outputPath) > 0)
+                         || fs::file_size(outputPath) == expectedSize)) {
+            ++verifiedFiles;
+            AAsset_close(asset);
+            continue;
+        }
+        const fs::path pending = outputPath.string() + ".extracting";
+        std::ofstream output(pending, std::ios::binary | std::ios::trunc);
         char buffer[32 * 1024];
         int read = 0;
         while (output && (read = AAsset_read(asset, buffer, sizeof(buffer))) > 0)
             output.write(buffer, read);
-        if (!output || read < 0) success = false;
+        output.flush();
+        bool copied = output.good() && read == 0;
+        output.close();
+        copied = copied && !output.fail();
         AAsset_close(asset);
+        if (copied && fs::file_size(pending) == expectedSize) {
+            fs::rename(pending, outputPath);
+            ++verifiedFiles;
+        } else {
+            fs::remove(pending);
+            log_format(LogLevel::ERROR, TAG, "Could not extract runtime asset {}", assetPath);
+            success = false;
+        }
     }
-    AAssetDir_close(directory);
+    env->DeleteLocalRef(names);
     return success;
 }
 
 static bool extract_injected_runtime(JNIEnv *env, const FusionConfig &config) {
     const fs::path marker = fs::path(config.bepInExDirectory).parent_path() / ".popemanager-runtime-v1";
-    if (fs::exists(marker)) return true;
     jobject activity = getUnityActivity(env);
     if (!activity) return false;
     jclass activityClass = env->GetObjectClass(activity);
     jmethodID getAssets = env->GetMethodID(activityClass, "getAssets", "()Landroid/content/res/AssetManager;");
     jobject javaAssets = getAssets ? env->CallObjectMethod(activity, getAssets) : nullptr;
     AAssetManager *assets = javaAssets ? AAssetManager_fromJava(env, javaAssets) : nullptr;
-    bool ok = assets && extract_asset_tree(assets, "PopeMods/runtime/BepInEx", config.bepInExDirectory)
-        && extract_asset_tree(assets, "PopeMods/runtime/dotnet", config.dotnetDirectory);
+    jclass assetClass = javaAssets ? env->GetObjectClass(javaAssets) : nullptr;
+    jmethodID listAssets = assetClass ? env->GetMethodID(assetClass, "list", "(Ljava/lang/String;)[Ljava/lang/String;") : nullptr;
+    size_t verifiedFiles = 0;
+    bool ok = false;
+    try {
+        fs::remove(marker);
+        ok = assets && listAssets
+            && extract_asset_tree(env, javaAssets, listAssets, assets, "PopeMods/runtime/BepInEx", config.bepInExDirectory, verifiedFiles)
+            && extract_asset_tree(env, javaAssets, listAssets, assets, "PopeMods/runtime/dotnet", config.dotnetDirectory, verifiedFiles)
+            && fs::is_regular_file(fs::path(config.bepInExDirectory) / "core/BepInEx.Unity.IL2CPP.dll")
+            && fs::is_regular_file(fs::path(config.bepInExDirectory) / "core/BepInEx.Core.dll")
+            && fs::is_regular_file(fs::path(config.dotnetDirectory) / "System.Private.CoreLib.dll");
+        if (ok) {
+            fs::create_directories(fs::path(config.bepInExDirectory) / "plugins");
+            std::ofstream output(marker, std::ios::trunc);
+            output << "ok\n";
+            output.close();
+            ok = !output.fail();
+        }
+    } catch (const std::exception &error) {
+        log_format(LogLevel::ERROR, TAG, "Runtime extraction failed: {}", error.what());
+        ok = false;
+    }
+    if (assetClass) env->DeleteLocalRef(assetClass);
     if (javaAssets) env->DeleteLocalRef(javaAssets);
     if (activityClass) env->DeleteLocalRef(activityClass);
     if (activity) env->DeleteLocalRef(activity);
@@ -84,7 +139,7 @@ static bool extract_injected_runtime(JNIEnv *env, const FusionConfig &config) {
         log(LogLevel::ERROR, TAG, "Could not extract the FusionCore runtime.");
         return false;
     }
-    std::ofstream(marker, std::ios::trunc) << "ok\n";
+    log_format(LogLevel::INFO, TAG, "Verified {} runtime files, including BepInEx/core", verifiedFiles);
     return true;
 }
 
@@ -116,6 +171,18 @@ static FusionConfig gorilla_tag_config(JNIEnv *env) {
     config.dotnetDirectory = (root / "dotnet").string();
     config.unityDataDirectory = (root / "Data").string();
     config.unityVersion = "6000.0.0";
+    jmethodID getAssets = env->GetMethodID(context, "getAssets", "()Landroid/content/res/AssetManager;");
+    jobject javaAssets = getAssets ? env->CallObjectMethod(activity, getAssets) : nullptr;
+    AAssetManager *assets = javaAssets ? AAssetManager_fromJava(env, javaAssets) : nullptr;
+    AAsset *versionAsset = assets ? AAssetManager_open(assets,
+        "PopeMods/runtime/BepInEx/UnityVersion.txt", AASSET_MODE_STREAMING) : nullptr;
+    if (versionAsset) {
+        char version[128] = {};
+        const int size = AAsset_read(versionAsset, version, sizeof(version) - 1);
+        if (size > 0) config.unityVersion.assign(version, size);
+        AAsset_close(versionAsset);
+    }
+    if (javaAssets) env->DeleteLocalRef(javaAssets);
     config.useOriginalLibUnity = true;
     config.isIl2Cpp2Mono = false;
     config.initialized = !config.gameLibraryDirectory.empty() && !externalPath.empty();
@@ -186,6 +253,7 @@ int il2cpp_init_hook(char *domain_name)
 {
     const char *d_name = domain_name ? domain_name : "Unknown Domain Name";
     log_format(LogLevel::INFO, TAG, "il2cpp_init called with domain: {}", d_name);
+    il2cpp_restore_library_loads();
     il2cpp_destroy_init_hook();
 
     // call the original il2cpp_init function
@@ -200,6 +268,8 @@ int il2cpp_init_hook(char *domain_name)
         setenv("FUSION_GAME_DATA_DIR", runtime_config.unityDataDirectory.c_str(), 1);
         setenv("FUSION_APP_DATA_DIR", runtime_config.appDataDirectory.c_str(), 1);
         setenv("FUSION_UNITY_VERSION", runtime_config.unityVersion.c_str(), 1);
+        const auto preloaderLog = (fs::path(runtime_config.bepInExDirectory) / "preloader.log").string();
+        setenv("BEPINEX_PRELOADER_LOG", preloaderLog.c_str(), 1);
 
         const char *ssl_cert_path = "/apex/com.android.conscrypt/cacerts";
         const char *backup_cert_path = "/system/etc/security/cacerts";
@@ -225,6 +295,9 @@ int il2cpp_init_hook(char *domain_name)
         dotNetConfig.IsMono = runtime_config.isIl2Cpp2Mono;
         // set TMPDIR for MonoMod lib drops
         setenv("TMPDIR", runtime_config.codeCacheDirectory.c_str(), 1);
+
+        setenv("HOME", runtime_config.appDataDirectory.c_str(), 1);
+        setenv("XDG_CACHE_HOME", runtime_config.codeCacheDirectory.c_str(), 1);
 
         // create AuxFolderPluginList
         auto aux = runtime_config.auxiliaryPluginFolders;
@@ -314,8 +387,8 @@ extern "C" [[maybe_unused]] bool fusion_bootstrap_from_libmain(JNIEnv *env)
 
     log(LogLevel::INFO, TAG, "Installing il2cpp hooks...");
     il2cpp_install_init_hook(il2cpp_init_hook);
+    if (injected && !il2cpp_redirect_library_loads()) return false;
     log(LogLevel::INFO, TAG, "il2cpp hooks installed successfully!");
     log(LogLevel::INFO, TAG, "FusionCore bootstrap finished successfully.");
     return true;
 }
-

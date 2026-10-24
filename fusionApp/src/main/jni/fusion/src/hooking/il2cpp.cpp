@@ -6,6 +6,7 @@
 #include <logger.h>
 #include <dlfcn.h>
 #include <exports.h>
+#include <cstring>
 
 #define TAG "FusionIL2CPP"
 
@@ -15,6 +16,45 @@ static void *p_il2cpp_init;
 
 static il2cpp_init_t fun_il2cpp_init = nullptr;
 static il2cpp_init_t init_hook = nullptr;
+static void *(*original_dlopen)(const char *, int) = nullptr;
+
+static void *redirect_il2cpp_dlopen(const char *path, int flags)
+{
+    if (path && handle) {
+        const char *slash = std::strrchr(path, '/');
+        const char *name = slash ? slash + 1 : path;
+        if (std::strcmp(name, "libil2cpp.so") == 0) {
+            log_format(LogLevel::INFO, TAG, "Reusing instrumented IL2CPP for Unity load: {}", path);
+            return handle;
+        }
+    }
+    return original_dlopen(path, flags);
+}
+
+bool il2cpp_redirect_library_loads()
+{
+    if (original_dlopen) return true;
+    if (!handle) return false;
+    const int result = DobbyHook(reinterpret_cast<void *>(dlopen),
+        reinterpret_cast<dobby_dummy_func_t>(redirect_il2cpp_dlopen),
+        reinterpret_cast<dobby_dummy_func_t *>(&original_dlopen));
+    if (result != 0) {
+        log_format(LogLevel::ERROR, TAG, "Could not redirect IL2CPP library loads: {}", result);
+        return false;
+    }
+    return true;
+}
+
+void il2cpp_restore_library_loads()
+{
+    if (!original_dlopen) return;
+    if (DobbyDestroy(reinterpret_cast<void *>(dlopen)) != 0) {
+        log(LogLevel::ERROR, TAG, "Could not restore the Android library loader");
+        return;
+    }
+    original_dlopen = nullptr;
+    log(LogLevel::INFO, TAG, "Unity acquired IL2CPP!");
+}
 
 #if defined(__aarch64__)
 static void disable_export_caller_check(void *export_function)

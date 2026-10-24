@@ -13,6 +13,10 @@ bool il2cpp_initialize(const char *library_path);
 // returns the handle to libil2cpp.so
 void *il2cpp_get_handle();
 
+// keep unity's later dlopen requests on the same IL2CPP instance.
+bool il2cpp_redirect_library_loads();
+void il2cpp_restore_library_loads();
+
 // returns the base address of libil2cpp.so
 uintptr_t il2cpp_get_library_base();
 

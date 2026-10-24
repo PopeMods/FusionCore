@@ -57,7 +57,7 @@ int dotnet_execute_assembly(const DotNetConfig& config, AuxPluginFolderList *aux
 
         setenv("DOTNET_ReadyToRun", "0", 1);
 
-        uint32_t hr = -1;
+        int32_t hr = -1;
         void *hostHandle = nullptr;
         unsigned int domainId = 0;
 
@@ -87,7 +87,7 @@ int dotnet_execute_assembly(const DotNetConfig& config, AuxPluginFolderList *aux
                 break;
             }
 
-            if (attempt == 1 && hr == HR_INTERNAL_ERROR)
+            if (attempt == 1 && static_cast<uint32_t>(hr) == HR_INTERNAL_ERROR)
             {
                 // Retry with W^X enabled
                 setenv("DOTNET_EnableWriteXorExecute", "1", 1);
