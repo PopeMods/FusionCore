@@ -4,3 +4,4 @@
 .cxx/
 build/
 local.properties
+/.kotlin/errors

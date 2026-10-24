@@ -13,12 +13,114 @@
 #include <external/dobby.h>
 #include <utilities/java.h>
 #include <dlfcn.h>
+#include <android/asset_manager.h>
+#include <android/asset_manager_jni.h>
+#include <fstream>
 
 #define TAG "FusionCore"
 
 namespace fs = std::filesystem;
 
 FusionConfig runtime_config;
+
+static std::string jstring_value(JNIEnv *env, jstring value) {
+    if (!value) return {};
+    const char *chars = env->GetStringUTFChars(value, nullptr);
+    std::string result = chars ? chars : "";
+    if (chars) env->ReleaseStringUTFChars(value, chars);
+    return result;
+}
+
+static bool extract_asset_tree(AAssetManager *assets, const std::string &assetRoot,
+                               const fs::path &destination) {
+    AAssetDir *directory = AAssetManager_openDir(assets, assetRoot.c_str());
+    if (!directory) {
+        log_format(LogLevel::ERROR, TAG, "Could not open runtime asset directory {}", assetRoot);
+        return false;
+    }
+    fs::create_directories(destination);
+    bool success = true;
+    const char *name = nullptr;
+    while ((name = AAssetDir_getNextFileName(directory)) != nullptr) {
+        if (std::string_view(name).find("..") != std::string_view::npos) {
+            success = false;
+            continue;
+        }
+        const std::string assetPath = assetRoot + "/" + name;
+        const fs::path outputPath = destination / name;
+        AAsset *asset = AAssetManager_open(assets, assetPath.c_str(), AASSET_MODE_STREAMING);
+        if (!asset) {
+            success = extract_asset_tree(assets, assetPath, outputPath) && success;
+            continue;
+        }
+        fs::create_directories(outputPath.parent_path());
+        std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+        char buffer[32 * 1024];
+        int read = 0;
+        while (output && (read = AAsset_read(asset, buffer, sizeof(buffer))) > 0)
+            output.write(buffer, read);
+        if (!output || read < 0) success = false;
+        AAsset_close(asset);
+    }
+    AAssetDir_close(directory);
+    return success;
+}
+
+static bool extract_injected_runtime(JNIEnv *env, const FusionConfig &config) {
+    const fs::path marker = fs::path(config.bepInExDirectory).parent_path() / ".popemanager-runtime-v1";
+    if (fs::exists(marker)) return true;
+    jobject activity = getUnityActivity(env);
+    if (!activity) return false;
+    jclass activityClass = env->GetObjectClass(activity);
+    jmethodID getAssets = env->GetMethodID(activityClass, "getAssets", "()Landroid/content/res/AssetManager;");
+    jobject javaAssets = getAssets ? env->CallObjectMethod(activity, getAssets) : nullptr;
+    AAssetManager *assets = javaAssets ? AAssetManager_fromJava(env, javaAssets) : nullptr;
+    bool ok = assets && extract_asset_tree(assets, "PopeMods/runtime/BepInEx", config.bepInExDirectory)
+        && extract_asset_tree(assets, "PopeMods/runtime/dotnet", config.dotnetDirectory);
+    if (javaAssets) env->DeleteLocalRef(javaAssets);
+    if (activityClass) env->DeleteLocalRef(activityClass);
+    if (activity) env->DeleteLocalRef(activity);
+    if (!ok) {
+        log(LogLevel::ERROR, TAG, "Could not extract the FusionCore runtime.");
+        return false;
+    }
+    std::ofstream(marker, std::ios::trunc) << "ok\n";
+    return true;
+}
+
+static FusionConfig gorilla_tag_config(JNIEnv *env) {
+    FusionConfig config{};
+    jobject activity = getUnityActivity(env);
+    if (!activity) return config;
+    jclass context = env->FindClass("android/content/Context");
+    jclass applicationInfo = env->FindClass("android/content/pm/ApplicationInfo");
+    auto getFilesDir = env->GetMethodID(context, "getFilesDir", "()Ljava/io/File;");
+    auto getCodeCacheDir = env->GetMethodID(context, "getCodeCacheDir", "()Ljava/io/File;");
+    auto getExternalFilesDir = env->GetMethodID(context, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;");
+    auto getApplicationInfo = env->GetMethodID(context, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
+    jclass fileClass = env->FindClass("java/io/File");
+    auto getPath = env->GetMethodID(fileClass, "getAbsolutePath", "()Ljava/lang/String;");
+    jobject files = env->CallObjectMethod(activity, getFilesDir);
+    jobject cache = env->CallObjectMethod(activity, getCodeCacheDir);
+    jobject external = env->CallObjectMethod(activity, getExternalFilesDir, nullptr);
+    jobject info = env->CallObjectMethod(activity, getApplicationInfo);
+    auto nativeLibraryDir = env->GetFieldID(applicationInfo, "nativeLibraryDir", "Ljava/lang/String;");
+    std::string filesPath = jstring_value(env, (jstring)env->CallObjectMethod(files, getPath));
+    std::string externalPath = jstring_value(env, external ? (jstring)env->CallObjectMethod(external, getPath) : nullptr);
+    config.gameLibraryDirectory = jstring_value(env, (jstring)env->GetObjectField(info, nativeLibraryDir));
+    config.appLibraryDirectory = config.gameLibraryDirectory;
+    config.appDataDirectory = filesPath.empty() ? "" : std::filesystem::path(filesPath).parent_path().string();
+    config.codeCacheDirectory = jstring_value(env, (jstring)env->CallObjectMethod(cache, getPath));
+    std::filesystem::path root = std::filesystem::path(externalPath) / "PopeManager" / "FusionCore";
+    config.bepInExDirectory = (root / "BepInEx").string();
+    config.dotnetDirectory = (root / "dotnet").string();
+    config.unityDataDirectory = (root / "Data").string();
+    config.unityVersion = "6000.0.0";
+    config.useOriginalLibUnity = true;
+    config.isIl2Cpp2Mono = false;
+    config.initialized = !config.gameLibraryDirectory.empty() && !externalPath.empty();
+    return config;
+}
 
 static bool execute_fusion_config(const FusionConfig &config)
 {
@@ -156,12 +258,13 @@ int il2cpp_init_hook(char *domain_name)
 
 extern "C" [[maybe_unused]] bool fusion_bootstrap_from_libmain(JNIEnv *env)
 {
-    (void) env;
-
     log(LogLevel::INFO, TAG, "FusionCore bootstrap starting...");
     jobject javaConfig = get_fusion_config(env);
-    FusionConfig config = fusion_parse_config(env, javaConfig);
-    env->DeleteLocalRef(javaConfig);
+    const bool injected = javaConfig == nullptr;
+    FusionConfig config = javaConfig ? fusion_parse_config(env, javaConfig) : gorilla_tag_config(env);
+    if (javaConfig) env->DeleteLocalRef(javaConfig);
+
+    if (injected && !extract_injected_runtime(env, config)) return false;
 
     log(LogLevel::INFO, TAG, "Executing Fusion bootstrap from libmain namespace...");
     if (!execute_fusion_config(config)) {
